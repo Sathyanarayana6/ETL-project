@@ -83,3 +83,100 @@ for zip_code, coordinates in location_data.items():
 
     # Concatenate data to the overall DataFrame
     weather_data = pd.concat([weather_data, daily_data.reset_index(drop=True)], ignore_index=True)
+
+# Connecting to Snowflake, creating a temporary .csv file in local and loading it to an internal Snowflake stage
+load_dotenv()
+
+snowflake_config = {
+    'user': os.getenv('SNOWFLAKE_USER'),
+    'password': os.getenv('SNOWFLAKE_PASSWORD'),
+    'account': os.getenv('SNOWFLAKE_ACCOUNT'),
+    'warehouse': os.getenv('SNOWFLAKE_WAREHOUSE'),
+    'database': os.getenv('SNOWFLAKE_DATABASE'),
+    'schema': os.getenv('SNOWFLAKE_SCHEMA'),
+    'stage_name': os.getenv('SNOWFLAKE_STAGE')
+}
+
+conn = snowflake.connector.connect(
+    user=snowflake_config['user'],
+    password=snowflake_config['password'],
+    account=snowflake_config['account'],
+    warehouse=snowflake_config['warehouse'],
+    database=snowflake_config['database'],
+    schema=snowflake_config['schema']
+)
+
+cursor = conn.cursor()
+
+try:
+    # Get the path to the desktop for the current user
+    desktop_path = os.path.expanduser("~/Desktop")
+    temp_csv_path = os.path.join(desktop_path, "weather_data.csv")
+
+    # Create the temporary .csv file
+    weather_data.to_csv(temp_csv_path, index=False, header=False)
+
+    # Upload data to Snowflake stage
+    cursor.execute(f"PUT file://{temp_csv_path} @{snowflake_config['stage_name']} OVERWRITE = TRUE ")
+
+    # Remove the temporary .csv file
+    os.remove(temp_csv_path)
+
+    print("Weather data successfully uploaded to Snowflake stage.")
+
+except snowflake.connector.errors.Error as e:
+    print(f"Error uploading weather data to Snowflake stage: {e}")
+
+# Copy the data from the stage into the target table
+try:
+    table_name = 'weather_data'
+    cursor.execute(f"CREATE TABLE IF NOT EXISTS {table_name} ( "
+                   f"row_id INT, "
+                   f"zipcode VARCHAR(5), "
+                   f"date DATE, "
+                   f"avg_temperature_celsius NUMBER, "
+                   f"min_temperature_celsius NUMBER, "
+                   f"max_temperature_celsius NUMBER, "
+                   f"precipitation NUMBER, "
+                   f"date_loaded TIMESTAMP) "
+    )
+
+    # Create a temporary table in Snowflake with the same structure as the target table
+    cursor.execute(f"CREATE OR REPLACE TEMPORARY TABLE {table_name}_temp AS "
+                   f"SELECT * FROM {table_name} WHERE 1=0")
+
+    # Copy data from the Snowflake stage to the temporary table
+    cursor.execute(f"COPY INTO {table_name}_temp "
+                   f"FROM @{snowflake_config['stage_name']}/ "
+                   f"FILES = ('weather_data.csv.gz') "
+                   f"FILE_FORMAT = (TYPE = CSV) "
+                   )
+
+    # Merge data from the temporary table into the main table (update existing rows, insert new rows)
+    cursor.execute(f"MERGE INTO {table_name} AS target "
+                   f"USING {table_name}_temp AS source "
+                   f"ON target.row_id = source.row_id "
+                   f"WHEN MATCHED THEN UPDATE SET "
+                   f"target.zipcode = source.zipcode, "
+                   f"target.date = source.date, "
+                   f"target.avg_temperature_celsius = source.avg_temperature_celsius, "
+                   f"target.min_temperature_celsius = source.min_temperature_celsius, "
+                   f"target.max_temperature_celsius = source.max_temperature_celsius, "
+                   f"target.precipitation = source.precipitation "
+                   f"WHEN NOT MATCHED THEN INSERT (row_id, zipcode, date, "
+                   f"avg_temperature_celsius, min_temperature_celsius, max_temperature_celsius, precipitation, date_loaded) "
+                   f"VALUES (source.row_id, source.zipcode, source.date, "
+                   f"source.avg_temperature_celsius, source.min_temperature_celsius, "
+                   f"source.max_temperature_celsius, source.precipitation, current_timestamp()) "
+                   )
+
+    # Remove the temporary table
+    cursor.execute(f"DROP TABLE IF EXISTS {table_name}_temp")
+
+    print("Weather data successfully copied from stage to Snowflake table.")
+
+except snowflake.connector.errors.Error as e:
+    print(f"Error copying weather data from stage to Snowflake table: {e}")
+
+# Close the Snowflake connection
+conn.close()
