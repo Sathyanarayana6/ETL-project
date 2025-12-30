@@ -24,3 +24,62 @@ zip_codes = [
     66617, 20456, 76192
 ]
 
+# Use pgeocode to get latitude and longitude for each zip code
+location_data = {}
+nomi = pgeocode.Nominatim('US')
+
+for zip_code in zip_codes:
+    location_info = nomi.query_postal_code(zip_code)
+    if not location_info.empty:
+        latitude, longitude = location_info.loc[['latitude', 'longitude']]
+        location_data[zip_code] = {'latitude': latitude, 'longitude': longitude}
+
+# Set time period
+start = datetime(2021, 2, 10)
+end = datetime(2021, 3, 5)
+
+# Initialize an empty DataFrame to store the results
+weather_data = pd.DataFrame()
+
+# Fetch weather data for each location using Meteostat
+for zip_code, coordinates in location_data.items():
+    point = Point(coordinates['latitude'], coordinates['longitude'])
+    daily_data = Daily(point, start, end).fetch()
+    daily_data = daily_data[['tavg', 'tmin', 'tmax', 'prcp']]
+
+    # Add a "zipcode" column with the corresponding zip code
+    daily_data['zipcode'] = str(zip_code)
+
+    # Add a "time" column with the date, convert it to datetime and extract the date part only
+    daily_data['date'] = daily_data.index
+    daily_data['date'] = pd.to_datetime(daily_data['date']).dt.date
+
+    # Add a "row_id" column as a unique identifier
+    daily_data['row_id'] = daily_data['zipcode'].astype(str) + '_' + daily_data['date'].astype(str)
+
+    # Add an empty "date_loaded" column
+    daily_data['date_loaded'] = pd.NaT
+
+    # Reorder the columns
+    daily_data = daily_data[['row_id', 'zipcode', 'date', 'tavg', 'tmin', 'tmax', 'prcp', 'date_loaded']]
+
+    # Rename columns
+    daily_data = daily_data.rename(columns={'tavg': 'avg_temperature_celsius',
+                                            'tmin': 'min_temperature_celsius',
+                                            'tmax': 'max_temperature_celsius',
+                                            'prcp': 'precipitation'})
+
+    # Cast remaining columns to specific data types
+    daily_data['zipcode'] = daily_data['zipcode'].astype(str)
+    daily_data['avg_temperature_celsius'] = daily_data['avg_temperature_celsius'].astype(float)
+    daily_data['min_temperature_celsius'] = daily_data['min_temperature_celsius'].astype(float)
+    daily_data['max_temperature_celsius'] = daily_data['max_temperature_celsius'].astype(float)
+    daily_data['precipitation'] = daily_data['precipitation'].astype(float)
+    daily_data['date_loaded'] = daily_data['date_loaded'].astype('datetime64[ns]')
+
+    # Replace NULL values with 0 in all float columns
+    float_columns = daily_data.select_dtypes(include=['float']).columns
+    daily_data[float_columns] = daily_data[float_columns].fillna(0)
+
+    # Concatenate data to the overall DataFrame
+    weather_data = pd.concat([weather_data, daily_data.reset_index(drop=True)], ignore_index=True)
